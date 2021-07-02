@@ -5,7 +5,7 @@ main() {
     GOARCH=$(detect_goarch)
     GOOS=$(detect_goos)
     NEXTDNS_BIN=$(bin_location)
-    LATEST_RELEASE=$(get_release)
+    INSTALL_RELEASE=$(get_release)
 
     export NEXTDNS_INSTALLER=1
 
@@ -13,9 +13,9 @@ main() {
     log_info "GOARCH: $GOARCH"
     log_info "GOOS: $GOOS"
     log_info "NEXTDNS_BIN: $NEXTDNS_BIN"
-    log_info "LATEST_RELEASE: $LATEST_RELEASE"
+    log_info "INSTALL_RELEASE: $INSTALL_RELEASE"
 
-    if [ -z "$OS" ] || [ -z "$GOARCH" ] || [ -z "$GOOS" ] || [ -z "$NEXTDNS_BIN" ] || [ -z "$LATEST_RELEASE" ]; then
+    if [ -z "$OS" ] || [ -z "$GOARCH" ] || [ -z "$GOOS" ] || [ -z "$NEXTDNS_BIN" ] || [ -z "$INSTALL_RELEASE" ]; then
         log_error "Cannot detect running environment."
         exit 1
     fi
@@ -29,10 +29,10 @@ main() {
         log_debug "Start install loop with CURRENT_RELEASE=$CURRENT_RELEASE"
 
         if [ "$CURRENT_RELEASE" ]; then
-            if [ "$CURRENT_RELEASE" != "$LATEST_RELEASE" ]; then
-                log_debug "NextDNS is out of date ($CURRENT_RELEASE != $LATEST_RELEASE)"
+            if ! is_version_current; then
+                log_debug "NextDNS is out of date ($CURRENT_RELEASE != $INSTALL_RELEASE)"
                 menu \
-                    u "Upgrade NextDNS from $CURRENT_RELEASE to $LATEST_RELEASE" upgrade \
+                    u "Upgrade NextDNS from $CURRENT_RELEASE to $INSTALL_RELEASE" upgrade \
                     c "Configure NextDNS" configure \
                     r "Remove NextDNS" uninstall \
                     e "Exit" exit
@@ -75,7 +75,7 @@ install() {
 }
 
 upgrade() {
-    if [ "$(get_current_release)" = "$LATEST_RELEASE" ]; then
+    if [ "$(get_current_release)" = "$INSTALL_RELEASE" ]; then
         log_info "Already on the latest version"
         return
     fi
@@ -200,8 +200,18 @@ install_bin() {
     if [ "$1" ]; then
         bin_path=$1
     fi
-    log_debug "Installing $LATEST_RELEASE binary for $GOOS/$GOARCH to $bin_path"
-    url="https://github.com/nextdns/nextdns/releases/download/v${LATEST_RELEASE}/nextdns_${LATEST_RELEASE}_${GOOS}_${GOARCH}.tar.gz"
+    log_debug "Installing $INSTALL_RELEASE binary for $GOOS/$GOARCH to $bin_path"
+    case "$INSTALL_RELEASE" in
+    */*)
+        # Snapshot
+        branch=${INSTALL_RELEASE%/*}
+        hash=${INSTALL_RELEASE#*/}
+        url="https://snapshot.nextdns.io/${branch}/nextdns-${hash}_${GOOS}_${GOARCH}.tar.gz"
+        ;;
+    *)
+        url="https://github.com/nextdns/nextdns/releases/download/v${INSTALL_RELEASE}/nextdns_${INSTALL_RELEASE}_${GOOS}_${GOARCH}.tar.gz"
+        ;;
+    esac
     log_debug "Downloading $url"
     asroot mkdir -p "$(dirname "$bin_path")" &&
         curl -sL "$url" | asroot sh -c "tar Ozxf - nextdns > \"$bin_path\"" &&
@@ -281,19 +291,19 @@ uninstall_deb() {
     asroot apt-get remove -y nextdns
 }
 
-install_alpine() {
+install_apk() {
     repo=https://repo.nextdns.io/apk
-    asroot curl -o /etc/apk/keys/nextdns.pub https://repo.nextdns.io/nextdns.pub &&
+    asroot wget -O /etc/apk/keys/nextdns.pub https://repo.nextdns.io/nextdns.pub &&
         (grep -v $repo /etc/apk/repositories; echo $repo) | asroot tee /etc/apk/repositories >/dev/null &&
         asroot apk update &&
         asroot apk add nextdns
 }
 
-upgrade_alpine() {
+upgrade_apk() {
     asroot apk update && asroot apk upgrade nextdns
 }
 
-uninstall_alpine() {
+uninstall_apk() {
     asroot apk del nextdns
 }
 
@@ -472,6 +482,12 @@ install_type() {
     if [ "$FORCE_INSTALL_TYPE" ]; then
         echo "$FORCE_INSTALL_TYPE"; return 0
     fi
+    case "$INSTALL_RELEASE" in
+    */*)
+        # Snapshot mode always use binary install
+        echo "bin"; return 0
+        ;;
+    esac
     case $OS in
     centos|fedora|rhel)
         echo "rpm"
@@ -481,6 +497,9 @@ install_type() {
         ;;
     debian|ubuntu|elementary|raspbian|linuxmint|pop|neon|sparky|vyos)
         echo "deb"
+        ;;
+    alpine)
+        echo "apk"
         ;;
     arch|manjaro)
         #echo "arch" # TODO: fix AUR install
@@ -828,7 +847,7 @@ detect_os() {
     case $(uname -s) in
     Linux)
         case $(uname -o) in
-        GNU/Linux)
+        GNU/Linux|Linux)
             if grep -q -e '^EdgeRouter' -e '^UniFiSecurityGateway' /etc/version 2> /dev/null; then
                 echo "edgeos"; return 0
             fi
@@ -849,6 +868,15 @@ detect_os() {
                 echo "$dist"; return 0
                 ;;
             esac
+            # shellcheck disable=SC1091
+            for dist in $(. /etc/os-release; echo "$ID_LIKE"); do
+                case $dist in
+                debian|ubuntu|rhel|fedora|openwrt)
+                    log_debug "Using ID_LIKE"
+                    echo "$dist"; return 0
+                    ;;
+                esac
+            done
             ;;
         ASUSWRT-Merlin*)
             echo "asuswrt-merlin"; return 0
@@ -885,7 +913,7 @@ detect_os() {
         ;;
     *)
     esac
-    log_error "Unsupported OS: $(uname -s)"
+    log_error "Unsupported OS: $(uname -o) $(grep ID "/etc/os-release" 2>/dev/null | xargs)"
     return 1
 }
 
@@ -956,6 +984,19 @@ bin_location() {
     esac
 }
 
+is_version_current() {
+    case "$INSTALL_RELEASE" in
+    */*)
+        # Snapshot
+        hash=${INSTALL_RELEASE#*/}
+        test "v0.0.0-$hash" = "$CURRENT_RELEASE"
+        ;;
+    *)
+        test "$INSTALL_RELEASE" = "$CURRENT_RELEASE"
+        ;;
+    esac
+}
+
 get_current_release() {
     if [ -x "$NEXTDNS_BIN" ]; then
         $NEXTDNS_BIN version|cut -d' ' -f 3
@@ -980,8 +1021,8 @@ get_release() {
             return
             ;;
         esac
-        out=$($cmd "https://api.github.com/repos/nextdns/nextdns/releases/latest")
-        v=$(echo "$out" | grep '"tag_name":' | esed 's/.*"([^"]+)".*/\1/' | sed -e 's/^v//')
+        v=$($cmd "https://api.github.com/repos/nextdns/nextdns/releases/latest" | \
+            grep '"tag_name":' | esed 's/.*"([^"]+)".*/\1/' | sed -e 's/^v//')
         if [ -z "$v" ]; then
             log_error "Cannot get latest version: $out"
         fi
